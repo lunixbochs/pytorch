@@ -281,6 +281,7 @@ std::vector<ExprHandle> TensorExprKernel::inferSizesForValue(
     case aten::lgamma:
     case aten::type_as:
     case aten::masked_fill:
+    case aten::nan_to_num:
       return sizesForValue(v->node()->input(0));
 
     case aten::sub:
@@ -681,7 +682,7 @@ Tensor* TensorExprKernel::computeThreeOperand(
   return Compute(
       name,
       c10::fmap<DimArg>(shape),
-      [this, v, innerExpr](const std::vector<VarHandle>& axes) {
+      [this, v, innerExpr, promote_inputs](const std::vector<VarHandle>& axes) {
         auto const& n = v->node();
         std::vector<ExprHandle> indices(axes.begin(), axes.end());
         std::vector<ExprHandle> inputs = {
@@ -704,7 +705,8 @@ Tensor* TensorExprKernel::computeFourOperand(
         const ExprHandle&,
         const ExprHandle&,
         const ExprHandle&,
-        const ExprHandle&)>& innerExpr) {
+        const ExprHandle&)>& innerExpr,
+    bool promote_inputs) {
   auto const& n = v->node();
   std::vector<std::vector<ExprHandle>> shapes;
   for (size_t idx = 0; idx < 4; idx++) {
@@ -715,7 +717,7 @@ Tensor* TensorExprKernel::computeFourOperand(
   return Compute(
       name,
       c10::fmap<DimArg>(shape),
-      [this, v, innerExpr](const std::vector<VarHandle>& axes) {
+      [this, v, innerExpr, promote_inputs](const std::vector<VarHandle>& axes) {
         auto const& n = v->node();
         std::vector<ExprHandle> indices(axes.begin(), axes.end());
         std::vector<ExprHandle> inputs = {
@@ -725,7 +727,9 @@ Tensor* TensorExprKernel::computeFourOperand(
             tensorOrConstant(n->inputs()[3], indices),
         };
 
-        promoteInputs(inputs);
+        if (promote_inputs) {
+          promoteInputs(inputs);
+        }
         ExprHandle compute =
             innerExpr(inputs[0], inputs[1], inputs[2], inputs[3]);
         return demoteOutput(compute, n->output());
@@ -909,6 +913,51 @@ Tensor* TensorExprKernel::computeValue(const torch::jit::Value* v) {
                 CompareSelect::make(mask, true_val, kEQ), val, input);
           },
           /*promote_inputs*/ false);
+    }
+
+    case aten::nan_to_num: {
+      auto node = v->node();
+      return computeFourOperand(
+          "nan_to_num",
+          v,
+          [node](
+              const ExprHandle& input,
+              const ExprHandle& nan,
+              const ExprHandle& pos_inf,
+              const ExprHandle& neg_inf) {
+            if (!input.dtype().is_floating_point()) {
+              return input;
+            }
+            auto value_or_default_at_index =
+                [&](size_t index, ExprHandle val, ExprHandle default_v) {
+                  if (node->inputs().at(index)->type() == NoneType::get()) {
+                    return default_v;
+                  } else {
+                    TORCH_INTERNAL_ASSERT(
+                        !node->input(index)->type()->cast<OptionalType>());
+                    return val;
+                  }
+                };
+            auto nan_val = value_or_default_at_index(
+                1, nan, Cast::make(input.dtype(), DoubleImm::make(0.)));
+            auto pos_inf_val = value_or_default_at_index(
+                2, pos_inf, maximumVal(input.dtype().scalar_type()));
+            auto neg_inf_val = value_or_default_at_index(
+                3, neg_inf, minimumVal(input.dtype().scalar_type()));
+
+            auto positive_infinity = infinityVal(input.dtype().scalar_type());
+            auto negative_infinity =
+                negInfinityVal(input.dtype().scalar_type());
+            auto pos_inf_replaced = ifThenElse(
+                CompareSelect::make(input, positive_infinity, kEQ),
+                pos_inf_val,
+                input);
+            auto infs_replaced = ifThenElse(
+                CompareSelect::make(input, negative_infinity, kEQ),
+                neg_inf_val,
+                pos_inf_replaced);
+            return ifThenElse(isnan(input), nan_val, infs_replaced);
+          });
     }
 
     case aten::clamp: {
