@@ -87,6 +87,10 @@ bool isSupported(Node* node) {
       "aten::clamp(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor",
       "aten::lerp.Scalar(Tensor self, Tensor end, Scalar weight) -> Tensor",
       "aten::lerp.Tensor(Tensor self, Tensor end, Tensor weight) -> Tensor",
+      "aten::to.dtype(Tensor self, ScalarType dtype, bool non_blocking=False, bool copy=False, MemoryFormat? memory_format=None) -> Tensor",
+      "aten::to.device(Tensor self, Device device, ScalarType dtype, bool non_blocking=False, bool copy=False, MemoryFormat? memory_format=None) -> Tensor",
+      "aten::to.dtype_layout(Tensor self, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, "
+      "bool? pin_memory=None, bool non_blocking=False, bool copy=False, MemoryFormat? memory_format=None) -> Tensor",
       "aten::isnan(Tensor self) -> Tensor",
       "aten::lgamma(Tensor self) -> Tensor",
       "aten::log10(Tensor self) -> Tensor",
@@ -534,6 +538,16 @@ class TensorExprFuser {
     }
   }
 
+  // No Ops in eager shouldn't be outputs of Fusion Groups
+  static bool unexecutedEagerOp(Node* n) {
+    if (n->kind() != aten::to) {
+      return false;
+    }
+
+    return *n->input(0)->type()->expect<TensorType>() ==
+        *n->output()->type()->expect<TensorType>();
+  }
+
   std::pair<graph_node_list::iterator, bool> scanNode(Node* n) {
     GRAPH_DEBUG("Considering node:", *n)
 
@@ -544,7 +558,7 @@ class TensorExprFuser {
     // fusion group from - skip them.
     if (n->kind() == prim::ListConstruct || n->kind() == aten::slice ||
         n->kind() == aten::unsqueeze || n->kind() == prim::ConstantChunk ||
-        n->kind() == prim::Constant) {
+        n->kind() == prim::Constant || unexecutedEagerOp(n)) {
       return std::make_pair(++n->reverseIterator(), false);
     }
     return createFusionGroup(n);
@@ -740,7 +754,7 @@ class TensorExprFuser {
     return true;
   }
 
-  bool typesAreSupported(const Node* node) {
+  bool typesAreSupported(Node* node) {
     // clang-format off
     // breaks up the schema strings so they are no longer discoverable with ctrl-F
     static const OperatorSet float_only_operator_set{
@@ -760,6 +774,40 @@ class TensorExprFuser {
             return false;
           }
         } else if (!v->type()->cast<FloatType>()) {
+          return false;
+        }
+      }
+    }
+    if (node->kind() == aten::to) {
+      // only support same-device conversion
+      auto device = tensorexpr::pickDeviceType(node->inputs());
+      auto output_device = tensorexpr::pickDeviceType(node->outputs());
+      if (!device || !output_device || *device != *output_device) {
+        return false;
+      }
+
+      // https://github.com/pytorch/pytorch/issues/49063
+      auto maybe_input_dtype =
+          node->input(0)->type()->expect<TensorType>()->scalarType();
+      auto maybe_output_dtype =
+          node->output(0)->type()->expect<TensorType>()->scalarType();
+      if (!maybe_input_dtype || !maybe_output_dtype) {
+        return false;
+      }
+      auto input_dtype = *maybe_input_dtype;
+      auto output_dtype = *maybe_output_dtype;
+
+      if (input_dtype == at::ScalarType::Double &&
+          output_dtype == at::ScalarType::Half) {
+        return false;
+      }
+      if (isFloatingType(input_dtype) && output_dtype == at::ScalarType::Bool) {
+        return false;
+      }
+
+      // all non-Tensor arguments must be constant
+      for (size_t i = 1; i < node->inputs().size(); i++) {
+        if (node->inputs().at(i)->node()->kind() != prim::Constant) {
           return false;
         }
       }
